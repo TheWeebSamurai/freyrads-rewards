@@ -18,7 +18,7 @@ res.status(200).json({message: "Freyr Rewards API is running."})
 // })
 
 app.post('/discord_bot/admin/create_link', async (req, res) => {
-    const { code, password } = req.body;
+    const { code, password, discord_user_id } = req.body;
     console.log(code, password)
     if(password !== config.api_password) return res.status(403).json({message: "Forbidden"})
     const lootlabs = new Lootlabs()
@@ -32,7 +32,7 @@ app.post('/discord_bot/admin/create_link', async (req, res) => {
         
     // }
 
-    await redis.set(`reward:${code}` , JSON.stringify({created_at: Date.now(), claimed: false, reward_code: code}), ) 
+    await redis.set(`reward:${code}` , JSON.stringify({created_at: Date.now(), reward_code: code, status: "PENDING", code_for: discord_user_id}), 1000 * 60 * 30) 
 
 
     return res.status(200).json({message: "Link created", link: reward_code})
@@ -41,10 +41,11 @@ app.post('/discord_bot/admin/create_link', async (req, res) => {
 })
 
 app.post('/rewards/discord/claim', async (req, res) => {
-    const { code, password } = req.body;
+    const { code, password, discordUserId } = req.body;
     if (password !== config.api_password) {
         return res.status(403).json({ message: "Forbidden" });
     }
+    if(!discordUserId) return res.status(400).json({message: "Invalid form body"})
     
     const reward_data = await redis.get(`reward:${code}`);
     if (!reward_data) {
@@ -52,31 +53,116 @@ app.post('/rewards/discord/claim', async (req, res) => {
     }
 
     const rewardInfo = JSON.parse(reward_data);
-    if (rewardInfo.claimed) {
+    if (rewardInfo.status === "CLAIMED") {
         return res.status(400).json({ message: "Already claimed" });
     }
+
+    if (rewardInfo.status !== "COMPLETED") {
+      return res.status(403).json({
+        message: "Complete the LootLabs offer first"
+      });
+    }
+
+    if(rewardInfo.code_for !== discordUserId) {
+      return res.status(403).json({
+        message: "This code is not for youi"
+      })
+    }
     
-    rewardInfo.claimed = true;
+    rewardInfo.status = "CLAIMED";
+    rewardInfo.claimed_by = discordUserId;
+    
     await redis.set(`reward:${code}`, JSON.stringify(rewardInfo));
     return res.status(200).json({ message: "Reward claimed" });
 });
 
+// app.get('/rewards/discord/sessions/:ran-code', async(req, res) => {
+//   const secret = req.query.ra as string;
+//   if(secret !== config.lootlabs_secret) return res.status(404).json({message: "Forbidden!"});
+//   let code = await redis.get(click_id)
+//   console.log(code)
+// })
 
-app.get("/rewards/discord/:code", async (req, res) => {
-  const { code } = req.params;
 
-  const reward_data = await redis.get(`reward:${code}`);
-  if (!reward_data) {
-        return res.status(404).send(renderExpiredPage())
+app.get("/rewards/discord/sessions/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+
+
+  let code = await redis.get(`session:${sessionId}`);
+  if (!code) {
+    code = await redis.get(`completed_session:${sessionId}`);
   }
-    const rewardInfo = JSON.parse(reward_data);
-    if (rewardInfo.claimed) {
-        return res.status(400).send(renderAlreadyClaimedPage());
-    } else {
-            res.cookie("reward_code", rewardInfo.reward_code, { maxAge: 1000 * 60 * 60 * 24, httpOnly: true, sameSite: 'lax' });
-            return res.send(renderRewardPage(code));
-    }
+
+  if (!code) {
+    return res.send(renderExpiredPage());
+  }
+  
+  const rewardRaw = await redis.get(`reward:${code}`);
+  if (!rewardRaw) return res.send(renderExpiredPage())
+  
+  const reward = JSON.parse(rewardRaw);
+  if (reward.status !== "COMPLETED") {
+    return res.send(renderExpiredPage());
+  }
+  return res.send(renderRewardPage(code));
 });
+
+app.get("/lootlabs/postback", async (req, res) => {
+  console.log("🔥 GOT POSTBACK FROM LOOTLABS");
+
+  const session_id = req.query.click_id as string;
+  const secret = req.query.secret as string
+
+  console.log(session_id, secret)
+if(secret !== config.lootlabs_secret) {
+  return res.status(404).json({message: "Forbidden"})
+}
+
+  const code = await redis.get(`session:${session_id}`);
+if (!code) return res.send("SESSION_NOT_FOUND");
+
+  console.log("Reward code:", session_id);
+
+  if (!session_id) {
+    console.log("❌ NO UNIQUE_ID");
+    return res.send("NO_CODE");
+  }
+
+  // const raw = await redis.get(`session:${session_id}`);
+  // if (!raw) {
+  //   console.log("❌ NOT FOUND IN REDIS");
+  //   return res.send("NOT_FOUND");
+  // }
+  const rewardRaw = await redis.get(`reward:${code}`);
+  if (!rewardRaw) return res.send("REWARD_NOT_FOUND");
+  const reward = JSON.parse(rewardRaw);
+
+  if (reward.status !== "PENDING") {
+    console.log("ℹ️ Already processed");
+    return res.send("OK");
+  }
+
+  reward.status = "COMPLETED";
+
+  await redis.set(
+    `reward:${code}`,
+    JSON.stringify(reward),
+    1000 * 60 * 5
+  );
+
+  await redis.set(
+  `completed_session:${session_id}`,
+  code,
+  1000 * 60 * 30
+);
+
+
+  console.log("✅ REWARD MARKED COMPLETED");
+  return res.send("OK");
+});
+
+
+
 
 app.get("/rewards/discord", async (req, res) => {
     const reward_code = req.cookies.reward_code;
